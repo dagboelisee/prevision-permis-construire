@@ -1,0 +1,266 @@
+---
+title: "Prévision du nombre de logements individuels autorisés en France"
+subtitle: "Techniques de prévision et conjoncture"
+author: "DAGBO Élisée"
+lang: fr
+format:
+  pdf:
+    toc: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+# Packages et données
+
+```{r}
+library(readr)
+library(tsoutliers)
+library(forecast)
+library(smooth)      # auto.adam, auto.ssarima
+library(TSA)         # periodogram
+library(moments)
+library(fBasics)
+library(ggplot2)
+library(RJDemetra)   # nécessite Java
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(seastests)
+```
+
+Source : INSEE, nombre de logements individuels autorisés à la construction en France (hors Mayotte), mensuel, janvier 2001 à décembre 2020 (240 observations).
+
+```{r}
+y <- read_delim("data/valeurs_mensuellesS.csv", delim = ";",
+                escape_double = FALSE, trim_ws = TRUE)
+yy <- ts(y$Nbr_const_ind_aut, start = c(2001, 1), frequency = 12)
+```
+
+# Analyse exploratoire
+
+## Présentation de la série
+
+```{r}
+plot.ts(yy, main = "Logements individuels autorisés (France)",
+        ylab = "Nombre de logements", xlab = "Temps", col = "blue")
+ggseasonplot(yy, col = rainbow(12), year.labels = TRUE)
+```
+
+La série baisse à long terme (maximum entre 2005 et 2007, creux entre 2013 et 2015, chute en avril 2020) et présente une forte saisonnalité : hausse en juillet, creux en août, rebond en septembre.
+
+## Points atypiques (tsoutliers)
+
+```{r}
+fit <- tso(yy)
+plot(fit)
+fit$outliers
+```
+
+Les points détectés (méthode de Chen et Liu, 1993) sont : TC en 2009:02, AO en 2011:05, TC en 2013:01, AO en 2013:02, LS en 2013:04 et TC en 2020:04. Les trois plus forts (|t-stat|) sont :
+
+- **LS 2013:04 et AO 2013:02** : entrée en vigueur obligatoire de la RT 2012 au 1er janvier 2013. Les dépôts se sont concentrés fin 2012 (pic ponctuel en février 2013), puis le niveau a durablement baissé.
+- **TC 2020:04** : premier confinement lié au COVID-19, services d'urbanisme fermés ou au ralenti, choc temporaire.
+
+Ces explications sont des hypothèses économiques plausibles, non testées ici.
+
+```{r}
+adj <- fit$yadj   # série corrigée des points atypiques
+plot(adj, main = "Série corrigée des points atypiques")
+```
+
+> **Remarque.** La détection des points atypiques est faite sur toute la période, 2020 comprise, donc la série corrigée `adj` ne contient plus le choc d'avril 2020. C'est cette série qui sert de cible dans la partie prévision (comme demandé par l'énoncé) ; une vérification sur la série brute est faite à la fin.
+
+## Statistiques descriptives de la série corrigée
+
+```{r}
+basicStats(adj)
+ggplot(tibble(valeur = as.numeric(adj)), aes(y = valeur)) +
+  geom_boxplot(fill = "royalblue", alpha = 0.5) +
+  labs(title = "Boîte à moustaches de la série corrigée", y = "Nombre de logements") +
+  theme_minimal()
+```
+
+## Saisonnalité
+
+```{r}
+combined_test(adj)      # test de Webel-Ollech
+seasdum(adj)            # variables dichotomiques saisonnières
+
+dadj <- diff(adj, differences = 1)
+par(mfrow = c(1, 2))
+periodogram(yy,   main = "Série en niveau")
+periodogram(dadj, main = "Différence première")
+par(mfrow = c(1, 1))
+```
+
+## Désaisonnalisation X13-ARIMA-SEATS (RJDemetra)
+
+```{r}
+myspec  <- x13_spec("RSA5c")
+mysax13 <- x13(adj, myspec)
+summary(mysax13$regarima)
+plot(mysax13)
+```
+
+La procédure retient une décomposition multiplicative (transformation logarithmique), un RegARIMA(0,1,1)(1,1,1)<sub>12</sub> et des effets de calendrier (samedi, lundi, mercredi, Pâques).
+
+# Prévision à un an (2020)
+
+Les modèles sont **tous estimés sur la période d'apprentissage janvier 2001 à décembre 2019**, puis comparés sur 2020.
+
+```{r}
+train <- window(adj, start = c(2001, 1), end = c(2019, 12))
+test  <- window(adj, start = c(2020, 1), end = c(2020, 12))
+h <- 12
+```
+
+## Naïve saisonnière, X13, STL, STS
+
+```{r}
+prev_snaive <- snaive(train, h = h)
+
+myregx13_train <- regarima_x13(train, spec = "RG5c")
+summary(myregx13_train)
+prev_x13 <- myregx13_train$forecast[1:h]
+
+fitstl  <- stlm(train)
+prevstl <- forecast(fitstl, h = h)
+
+fitsts  <- StructTS(train)
+prevsts <- forecast(fitsts, h = h)
+```
+
+## Lissage exponentiel
+
+```{r}
+fithw   <- HoltWinters(train, seasonal = "mul")
+prevhw  <- forecast(fithw, h = h)
+
+fitets  <- ets(train)
+prevets <- forecast(fitets, h = h)
+
+fittbats  <- tbats(train)
+prevtbats <- forecast(fittbats, h = h)
+
+fitadam1  <- auto.adam(train, model = "MAdA", lags = c(1, 12), select = TRUE)
+prevadam1 <- forecast(fitadam1, h = h)
+
+fitadam2  <- auto.adam(train, model = "MAdA", lags = c(1, 12),
+                       orders = list(ar = c(3, 3), i = c(2), ma = c(3, 3)),
+                       select = TRUE)
+prevadam2 <- forecast(fitadam2, h = h)
+```
+
+## SARIMA et SSARIMA
+
+```{r}
+fitsarima  <- auto.arima(train)
+prevsarima <- forecast(fitsarima, h = h, level = 0.90)
+
+# CORRECTION : SSARIMA estimé sur `train` (et non sur toute la série `adj`)
+fitssarima  <- auto.ssarima(train, lags = c(1, 12),
+                            orders = list(ar = c(3, 3), i = c(2), ma = c(3, 3)),
+                            select = TRUE)
+prevssarima <- forecast(fitssarima, h = h, level = 0.90)
+```
+
+# Comparaison graphique des prévisions
+
+```{r}
+dates <- seq(as.Date("2020-01-01"), by = "month", length.out = h)
+obs   <- as.numeric(test)
+
+df_forecasts <- data.frame(
+  Date = dates,
+  SNaive = as.numeric(prev_snaive$mean),
+  X13.SARIMA.SEATS = as.numeric(prev_x13),
+  STL = as.numeric(prevstl$mean),
+  STS = as.numeric(prevsts$mean),
+  Holt.Winters = as.numeric(prevhw$mean),
+  ETS = as.numeric(prevets$mean),
+  TBATS = as.numeric(prevtbats$mean),
+  ADAM.ETS = as.numeric(prevadam1$mean),
+  ADAM.ETS.SARIMA = as.numeric(prevadam2$mean),
+  SARIMA = as.numeric(prevsarima$mean),
+  SSARIMA = as.numeric(prevssarima$mean),
+  Realisee = obs
+)
+
+# contrôle de cohérence : toutes les prévisions ont 12 valeurs, dans l'échelle de la série
+stopifnot(nrow(df_forecasts) == 12)
+summary(df_forecasts[, -1])
+
+df_long <- pivot_longer(df_forecasts, -Date, names_to = "Methode", values_to = "Valeur")
+ggplot(df_long, aes(Date, Valeur, color = Methode)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Prévisions des différents modèles (2020)", x = "Temps",
+       y = "Logements autorisés") +
+  theme_minimal(base_size = 12) +
+  theme(legend.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Qualité de prévision : MSE et R²OOS
+
+Le R²<sub>OOS</sub> compare chaque modèle à la prévision naïve saisonnière : R²<sub>OOS</sub> = 1 − MSE<sub>modèle</sub> / MSE<sub>naïf</sub>. Une valeur positive signifie que le modèle fait mieux que le naïf.
+
+```{r}
+previsions <- df_forecasts |> select(-Date, -Realisee)
+mse_naive  <- mean((obs - previsions$SNaive)^2)
+
+results <- tibble(Modele = names(previsions),
+                  MSE = map_dbl(previsions, ~ mean((obs - .x)^2))) |>
+  mutate(R2OOS = ifelse(Modele == "SNaive", NA, 1 - MSE / mse_naive)) |>
+  arrange(MSE)
+results
+```
+
+```{r}
+cspe_df <- map_dfc(previsions, ~ cumsum((obs - .x)^2)) |>
+  mutate(Date = dates) |>
+  pivot_longer(-Date, names_to = "Methode", values_to = "CSPE")
+
+ggplot(cspe_df, aes(Date, CSPE, color = Methode)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Erreur quadratique cumulée (CSPE) par modèle, 2020", x = "Temps", y = "CSPE") +
+  theme_minimal(base_size = 12) +
+  theme(legend.title = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Meilleur modèle selon le MSE : **`r results$Modele[1]`** (MSE = `r format(round(results$MSE[1]), big.mark = " ")`). Le MSE du modèle naïf est de `r format(round(mse_naive), big.mark = " ")` ; `r sum(results$R2OOS > 0, na.rm = TRUE)` modèle(s) obtiennent un R²<sub>OOS</sub> positif.
+
+# Test de Diebold-Mariano contre un AR(1)
+
+Hypothèse alternative « less » : l'erreur du modèle testé est significativement plus faible que celle de l'AR(1). Avec seulement 12 observations de test, le test est utilisé avec `h = 1` (erreurs quadratiques) : un horizon `h = 12` ferait porter l'estimation de variance sur 11 retards pour 12 points, ce qui est dégénéré. Les p-values sont à lire avec prudence.
+
+```{r}
+fitar1  <- Arima(train, order = c(1, 0, 0))
+err_ar1 <- obs - as.numeric(forecast(fitar1, h = h)$mean)
+
+dm <- map_dfr(names(previsions), function(m) {
+  e <- obs - previsions[[m]]
+  p <- tryCatch(dm.test(e, err_ar1, alternative = "less", h = 1, power = 2)$p.value,
+                error = function(err) NA_real_)
+  tibble(Modele = m, p_value_DM = p)
+}) |> arrange(p_value_DM)
+dm
+```
+
+# Vérification sur la série brute (non corrigée)
+
+La série `adj` n'a plus le choc de 2020. On recalcule le MSE contre la série brute pour voir si le classement change.
+
+```{r}
+obs_brut <- as.numeric(window(yy, start = c(2020, 1), end = c(2020, 12)))
+tibble(Modele = names(previsions),
+       MSE_brut = map_dbl(previsions, ~ mean((obs_brut - .x)^2))) |>
+  arrange(MSE_brut)
+```
+
+# Conclusion
+
+La série présente une tendance baissière, une saisonnalité très marquée et stable, et deux chocs conjoncturels identifiés (RT 2012 en 2013, confinement en 2020). Les modèles sont comparés sur l'année 2020, atypique, ce qui limite la portée des classements : un seul horizon de 12 mois et 12 observations de test. Le meilleur modèle, le R²<sub>OOS</sub> et les p-values de Diebold-Mariano figurent dans les tableaux ci-dessus et sont à lire à la lumière de ces limites.
+
+Les critères d'information (AIC) de modèles estimés sur des échelles différentes (logarithme pour X13, niveaux pour les autres) ou de familles différentes (ETS, ARIMA) **ne sont pas directement comparables** ; la sélection repose donc ici sur la qualité de prévision hors échantillon.

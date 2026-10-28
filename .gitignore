@@ -1,0 +1,8 @@
+.Rproj.user/
+.Rhistory
+.RData
+*_files/
+*.log
+*.aux
+*.out
+.quarto/
